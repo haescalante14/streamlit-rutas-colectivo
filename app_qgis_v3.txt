@@ -1,0 +1,233 @@
+﻿import streamlit as st
+import pandas as pd
+import geopandas as gpd
+import folium
+from streamlit_folium import st_folium, folium_static
+from pathlib import Path
+import numpy as np
+from datetime import datetime, timedelta
+
+# Configuración inicial
+st.set_page_config(layout="wide")
+st.title("🧭 Visualizador Avanzado de Rutas de Transporte")
+
+# Directorios base
+BASE_DIR = Path("C:/Users/HEscalante/Red 2025")
+RUTA_PARADAS = BASE_DIR / "Paradas CSV"
+
+# Buscar archivos recursivamente
+geojson_files = sorted(BASE_DIR.rglob("*.geojson"))
+csv_files = sorted(RUTA_PARADAS.glob("*.csv"))
+
+# Sidebar - Selección de archivos
+st.sidebar.header("📂 Configuración inicial")
+ruta_seleccionada = st.sidebar.selectbox("🗺️ Ruta GeoJSON", geojson_files)
+paradas_seleccionadas = st.sidebar.selectbox("🚌 Paradas CSV", csv_files)
+map_height = st.sidebar.slider("📏 Altura del mapa", 400, 900, 600, 50)
+
+# Constantes de velocidad (km/h)
+VELOCIDAD_NORMAL = 30
+VELOCIDAD_REDUCIDA = 15
+
+# Carga de datos con caché
+@st.cache_data
+def cargar_geojson(path):
+    return gpd.read_file(path)
+
+@st.cache_data
+def cargar_paradas(path):
+    try:
+        df = pd.read_csv(path, encoding='latin1')
+        required_cols = ['stop_lat', 'stop_lon', 'route_order']
+        if not all(col in df.columns for col in required_cols):
+            st.error(f"⚠️ Faltan columnas requeridas: {required_cols}")
+            return None
+        
+        df["route_control"] = df.get("route_control", False)
+        return df
+    except Exception as e:
+        st.error(f"Error al cargar CSV: {str(e)}")
+        return None
+
+if ruta_seleccionada and paradas_seleccionadas:
+    # Cargar datos
+    gdf_ruta = cargar_geojson(ruta_seleccionada)
+    df_paradas = cargar_paradas(paradas_seleccionadas)
+    
+    if df_paradas is None:
+        st.stop()
+
+    # Filtrado por línea si existe
+    if "linea" in df_paradas.columns:
+        linea_sel = st.sidebar.selectbox("🚌 Línea a visualizar", sorted(df_paradas["linea"].unique()))
+        df_paradas = df_paradas[df_paradas["linea"] == linea_sel].copy()
+    
+    # Ordenar paradas
+    df_paradas = df_paradas.sort_values("route_order").reset_index(drop=True)
+    
+    # --------------------------------------------------
+    # 🧭 Mover paradas directamente en el mapa
+    # --------------------------------------------------
+    st.sidebar.header("✏️ Herramientas de edición")
+    
+    # Crear mapa base
+    centro = [df_paradas['stop_lat'].mean(), df_paradas['stop_lon'].mean()]
+    m = folium.Map(location=centro, zoom_start=14, control_scale=True)
+    
+    # Añadir ruta
+    folium.GeoJson(
+        gdf_ruta,
+        name="Ruta",
+        style_function=lambda x: {'color': 'blue', 'weight': 4}
+    ).add_to(m)
+    
+    # Añadir capa para dibujar
+    draw_options = {
+        'polyline': False,
+        'rectangle': False,
+        'circle': False,
+        'marker': True,
+        'circlemarker': False,
+        'editMode': True
+    }
+    draw = folium.plugins.Draw(export=True, draw_options=draw_options)
+    draw.add_to(m)
+    
+    # Mostrar mapa y capturar interacciones
+    map_output = st_folium(m, height=map_height, width='100%', key='main_map')
+    
+    # --------------------------------------------------
+    # ✏️ Editar la línea del recorrido en el mapa
+    # --------------------------------------------------
+    st.sidebar.subheader("Editar geometría")
+    if st.sidebar.button("🔄 Actualizar geometría desde mapa"):
+        if map_output.get('last_active_drawing'):
+            new_geom = map_output['last_active_drawing']['geometry']
+            gdf_ruta.geometry = gpd.GeoSeries.from_geojson([new_geom])
+            st.success("Geometría actualizada!")
+    
+    # --------------------------------------------------
+    # 💾 Guardar como copia
+    # --------------------------------------------------
+    st.sidebar.subheader("Guardar versiones")
+    version = st.sidebar.text_input("Nombre de versión", "modificado")
+    
+    if st.sidebar.button("💾 Guardar copia"):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        new_filename = f"paradas_{version}_{timestamp}.csv"
+        save_path = RUTA_PARADAS / new_filename
+        df_paradas.to_csv(save_path, index=False, encoding='latin1')
+        st.sidebar.success(f"Guardado como: {new_filename}")
+    
+    # --------------------------------------------------
+    # 🕓 Cálculo de tiempos
+    # --------------------------------------------------
+    st.sidebar.header("🕓 Cálculo de tiempos")
+    hora_inicio = st.sidebar.time_input("Hora de inicio", datetime.strptime("06:00", "%H:%M"))
+    intervalo_base = st.sidebar.number_input("Intervalo entre paradas (min)", 1, 30, 3)
+    
+    if st.sidebar.button("Calcular tiempos"):
+        # Cálculo de distancias y tiempos (simplificado)
+        df_paradas['tiempo_estimado'] = np.nan
+        df_paradas['hora_llegada'] = ""
+        
+        current_time = datetime.combine(datetime.today(), hora_inicio)
+        
+        for i in range(len(df_paradas)):
+            df_paradas.at[i, 'hora_llegada'] = current_time.strftime("%H:%M:%S")
+            
+            if i < len(df_paradas) - 1:
+                # Simplificación: usamos intervalo fijo
+                tiempo_segmento = timedelta(minutes=intervalo_base)
+                
+                # Ajustar por paradas de control
+                if df_paradas.at[i, 'route_control']:
+                    tiempo_segmento += timedelta(minutes=2)
+                
+                current_time += tiempo_segmento
+                df_paradas.at[i, 'tiempo_estimado'] = tiempo_segmento.total_seconds() / 60
+        
+        st.success("Tiempos calculados!")
+    
+    # --------------------------------------------------
+    # Visualización de paradas y controles
+    # --------------------------------------------------
+    st.subheader("✅ Paradas de control")
+    edited_df = st.data_editor(
+        df_paradas,
+        column_config={
+            "route_control": st.column_config.CheckboxColumn(
+                "Control",
+                help="Marcar como parada de control"
+            )
+        },
+        use_container_width=True,
+        key="edit_paradas",
+        num_rows="dynamic"
+    )
+    
+    # Actualizar marcadores en el mapa
+    for _, row in edited_df.iterrows():
+        icon_color = "red" if row['route_control'] else "blue"
+        icon_type = "flag" if row['route_control'] else "map-marker"
+        
+        folium.Marker(
+            location=[row['stop_lat'], row['stop_lon']],
+            icon=folium.Icon(color=icon_color, icon=icon_type, prefix="fa"),
+            popup=f"{row.get('stop_name', 'Parada')}",
+            tooltip=f"Orden: {row['route_order']}"
+        ).add_to(m)
+    
+    # Mostrar mapa actualizado
+    folium_static(m, height=map_height, width='100%')
+    
+    # --------------------------------------------------
+    # Exportación de resultados
+    # --------------------------------------------------
+    st.subheader("📤 Exportar datos")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "💾 Descargar CSV editado",
+            edited_df.to_csv(index=False, encoding='latin1'),
+            file_name="paradas_editadas.csv",
+            mime="text/csv"
+        )
+    
+    with col2:
+        # Exportación GTFS simplificada
+        if 'hora_llegada' in edited_df.columns:
+            gtfs_trips = pd.DataFrame({
+                'route_id': ['R1'],
+                'service_id': ['LAB'],
+                'trip_id': ['R1_LAB_1']
+            })
+            
+            gtfs_stop_times = pd.DataFrame({
+                'trip_id': 'R1_LAB_1',
+                'stop_id': edited_df['stop_id'],
+                'arrival_time': edited_df['hora_llegada'],
+                'departure_time': edited_df['hora_llegada'],
+                'stop_sequence': edited_df['route_order']
+            })
+            
+            @st.cache_data
+            def convert_df_to_csv(df):
+                return df.to_csv(index=False).encode('utf-8')
+            
+            st.download_button(
+                "🚌 Exportar GTFS (stop_times.txt)",
+                convert_df_to_csv(gtfs_stop_times),
+                file_name="stop_times.txt",
+                mime="text/csv"
+            )
+    
+    # Mostrar resumen
+    st.subheader("📊 Resumen estadístico")
+    if 'tiempo_estimado' in edited_df.columns:
+        st.write(f"⏱️ Tiempo total estimado: {edited_df['tiempo_estimado'].sum():.1f} minutos")
+        st.write(f"🛑 Paradas de control: {edited_df['route_control'].sum()}")
+    
+else:
+    st.info("📌 Selecciona archivos en el panel lateral para comenzar")
