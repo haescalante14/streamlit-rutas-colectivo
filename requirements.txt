@@ -1,0 +1,8 @@
+streamlit
+pandas
+geopandas
+openrouteservice
+streamlit-folium
+folium
+shapely
+python-dotenv
